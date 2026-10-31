@@ -10,6 +10,6 @@ struct editorConfigOptions {
 
 extern struct editorConfigOptions C;
 
-void initConfigOptions( void );
+void initConfigOptions();
 
 #endif
