@@ -16,9 +16,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "config.h"
+
 /*   DEFINES   */
 #define ZINC_VERSION "0.1"
-#define ZINC_TAB_STOP 8
 #define ZINC_QUIT_TIMES 3
 
 #define CTRL_KEY( k ) ( (k) & 0x1f )
@@ -83,6 +84,12 @@ struct editorConfig {
 };
 
 struct editorConfig E;
+struct terminalState {
+  int raw_mode, supports_sgr_mouse, supports_truecolor, rows, cols;
+};
+
+struct terminalState T;
+int cleanup_done = 0;
 
 /*   FILETYPES   */
 char *C_HL_extensions[] = { ".c", ".h", ".cpp", NULL };
@@ -110,25 +117,76 @@ struct editorSyntax HLDB[] = {
 void editorSetStatusMessage( const char *fmt, ... );
 void editorRefreshScreen();
 char *editorPrompt( char *prompt, void (*callback)(char *, int) );
+void editorCleanup( void );
+ssize_t terminalRead( void *buf, size_t count );
+void terminalWrite( const char *s, size_t len );
+int terminalGetSize( int *rows, int *cols );
+void terminalDetectCapabilities( void );
+int getWindowSize( int *rows, int *cols );
+void initConfigOptions( void );
 
 /*   TERMINAL   */
 void die( const char *s ) {
-  write( STDOUT_FILENO, "\x1b[2J", 4 );
-  write( STDOUT_FILENO, "\x1b[H", 3 );
-
+  editorCleanup();
   perror( s );
   exit( 1 );
 }
 
+ssize_t terminalRead( void *buf, size_t count ) {
+  return read( STDIN_FILENO, buf, count );
+}
+
+void terminalWrite( const char *s, size_t len ) {
+  size_t written;
+  ssize_t result;
+
+  written = 0;
+  while ( written < len ) {
+    result = write( STDOUT_FILENO, &s[written], len - written );
+    if ( result <= 0 ) {
+      perror( "write" );
+      return;
+    }
+    written += result;
+  }
+}
+
+int terminalGetSize( int *rows, int *cols ) {
+  int result;
+
+  result = getWindowSize( rows, cols );
+  if ( result == 0 ) {
+    T.rows = *rows;
+    T.cols = *cols;
+  }
+  return result;
+}
+
+void terminalDetectCapabilities( void ) {
+  char *term;
+  char *colorterm;
+
+  term = getenv( "TERM" );
+  colorterm = getenv( "COLORTERM" );
+  T.supports_sgr_mouse = term != NULL && strcmp( term, "dumb" ) != 0;
+  T.supports_truecolor = colorterm != NULL &&
+    (strstr( colorterm, "truecolor" ) != NULL ||
+     strstr( colorterm, "24bit" ) != NULL);
+}
+
 void disableRawMode() {
+  if ( !T.raw_mode )
+    return;
+
   if ( tcsetattr( STDIN_FILENO, TCSAFLUSH, &E.orig_termios ) == -1 )
-    die( "tcsetattr" );
+    perror( "tcsetattr" );
+  T.raw_mode = 0;
 }
 
 void enableRawMode() {
   if ( tcgetattr( STDIN_FILENO, &E.orig_termios ) == -1 )
     die( "tcgetattr" );
-  atexit( disableRawMode );
+  atexit( editorCleanup );
 
   struct termios raw = E.orig_termios;
   raw.c_iflag &= ~(IXON | ICRNL | INPCK | ISTRIP | BRKINT);
@@ -141,27 +199,28 @@ void enableRawMode() {
 
   if ( tcsetattr( STDIN_FILENO, TCSAFLUSH, &raw ) == -1 )
     die( "tcsetattr" );
+  T.raw_mode = 1;
 }
 
 int editorReadKey() {
   int nread;
   char c;
 
-  while ( (nread = read( STDIN_FILENO, &c, 1 )) != 1 ) 
+  while ( (nread = terminalRead( &c, 1 )) != 1 ) 
     if ( nread == -1 && errno != EAGAIN )
       die( "read" );
 
   if ( c == '\x1b' ) {
     char seq[3];
 
-    if ( read( STDIN_FILENO, &seq[0], 1 ) != 1 )
+    if ( terminalRead( &seq[0], 1 ) != 1 )
       return '\x1b';
-    if ( read( STDIN_FILENO, &seq[1], 1 ) != 1 )
+    if ( terminalRead( &seq[1], 1 ) != 1 )
       return '\x1b';
 
     if ( seq[0] == '[' ) {
       if ( seq[1] >= '0' && seq[1] <= '9' ) {
-        if ( read( STDIN_FILENO, &seq[2], 1 ) != 1 )
+        if ( terminalRead( &seq[2], 1 ) != 1 )
           return '\x1b';
         if ( seq[2] == '~' ) {
           switch ( seq[1] ) {
@@ -201,11 +260,10 @@ int getCursorPosition( int *rows, int *cols ) {
   char buf[32];
   unsigned int i = 0;
 
-  if ( write( STDOUT_FILENO, "\x1b[6n", 4 ) != 4 )
-    return -1;
+  terminalWrite( "\x1b[6n", 4 );
 
   while ( i < sizeof( buf ) - 1 ) {
-    if ( read( STDIN_FILENO, &buf[i], 1 ) != 1 )
+    if ( terminalRead( &buf[i], 1 ) != 1 )
       break;
     if ( buf[i] == 'R' )
       break;
@@ -227,8 +285,7 @@ int getWindowSize( int *rows, int *cols ) {
 
   if ( ioctl( STDOUT_FILENO, TIOCGWINSZ, &ws ) == -1 || ws.ws_col == 0 ) {
     
-    if ( write( STDOUT_FILENO, "\x1b[999C\x1b[999B", 12 ) != 12 )
-      return -1;
+    terminalWrite( "\x1b[999C\x1b[999B", 12 );
 
     return getCursorPosition( rows, cols );
 
@@ -408,7 +465,7 @@ int editorRowCxToRx( erow *row, int cx ) {
   int rx = 0, j;
   for ( j = 0; j < cx; j++ ) {
     if ( row->chars[j] == '\t' )
-      rx += (ZINC_TAB_STOP - 1) - (rx % ZINC_TAB_STOP);
+      rx += (C.tab_width - 1) - (rx % C.tab_width);
     rx++;
   }
 
@@ -419,7 +476,7 @@ int editorRowRxToCx( erow *row, int rx ) {
   int cur_rx = 0, cx;
   for ( cx = 0; cx < row->size; cx++ ) {
     if ( row->chars[cx] == '\t' )
-      cur_rx += (ZINC_TAB_STOP - 1) - (cur_rx % ZINC_TAB_STOP);
+      cur_rx += (C.tab_width - 1) - (cur_rx % C.tab_width);
     cur_rx++;
 
     if ( cur_rx > rx )
@@ -435,13 +492,13 @@ void editorUpdateRow( erow *row ) {
       tabs++;
 
   free( row->render );
-  row->render = malloc( row->size + (ZINC_TAB_STOP - 1) * tabs + 1 );
+  row->render = malloc( row->size + (C.tab_width - 1) * tabs + 1 );
 
   int idx = 0;
   for ( j = 0; j < row->size; j++ ) {
     if ( row->chars[j] == '\t' ) {
       row->render[idx++] = ' ';
-      while ( idx % ZINC_TAB_STOP != 0 )
+      while ( idx % C.tab_width != 0 )
         row->render[idx++] = ' ';
     } else 
       row->render[idx++] = row->chars[j];
@@ -483,6 +540,21 @@ void editorFreeRow( erow *row ) {
   free( row->render );
   free( row->chars );
   free( row->hl );
+}
+
+void editorCleanup( void ) {
+  int i;
+
+  if ( cleanup_done )
+    return;
+  cleanup_done = 1;
+
+  disableRawMode();
+  for ( i = 0; i < E.numrows; i++ )
+    editorFreeRow( &E.row[i] );
+  free( E.row );
+  free( E.filename );
+  terminalWrite( "\x1b[2J\x1b[H", 7 );
 }
 
 void editorDelRow( int at ) {
@@ -881,7 +953,7 @@ void editorRefreshScreen() {
 
   abAppend( &ab, "\x1b[?25h", 6 );
 
-  write( STDOUT_FILENO, ab.b, ab.len );
+  terminalWrite( ab.b, ab.len );
   abFree( &ab );
 }
 
@@ -990,8 +1062,8 @@ void editorProcessKeypress() {
         quit_times--;
         return;
       }
-      write( STDOUT_FILENO, "\x1b[2J", 4 );
-      write( STDOUT_FILENO, "\x1b[H", 3 );
+      terminalWrite( "\x1b[2J", 4 );
+      terminalWrite( "\x1b[H", 3 );
 
       exit( 0 );
       break;
@@ -1060,11 +1132,16 @@ void editorProcessKeypress() {
 /*   INIT   */
 void initEditor() {
   E.cx = E.cy = E.numrows = E.rowoff = E.coloff = 
-    E.rx = E.statusmsg_time = E.dirty = 0;
-  E.row = E.filename = E.syntax = NULL;
+    E.rx = E.dirty = 0;
+  E.statusmsg_time = 0;
+  E.row = NULL;
+  E.filename = NULL;
+  E.syntax = NULL;
   E.statusmsg[0] = '\0';
+  initConfigOptions();
 
-  if ( getWindowSize( &E.screenrows, &E.screencols ) == -1 )
+  terminalDetectCapabilities();
+  if ( terminalGetSize( &E.screenrows, &E.screencols ) == -1 )
     die( "getWindowSize" );
 
   E.screenrows -= 2;
