@@ -129,7 +129,7 @@ struct editorSyntax HLDB[] = {
 
 /*   PROTOTYPES   */
 void editorSetStatusMessage( const char *fmt, ... );
-void editorRefreshScreen();
+void editorRefreshScreen( void );
 char *editorPrompt( char *prompt, void (*callback)(char *, int) );
 void editorCleanup( void );
 ssize_t terminalRead( void *buf, size_t count );
@@ -140,7 +140,6 @@ int getWindowSize( int *rows, int *cols );
 int terminalParseSgrMouseEvent( const char *sequence,
                                 struct mouseEvent *event );
 void terminalSetMouseReporting( int enabled );
-void editorToggleMouse( void );
 void terminalHandleResize( int signal_number );
 void editorHandleResize( void );
 void initConfigOptions( void );
@@ -240,13 +239,6 @@ void terminalSetMouseReporting( int enabled ) {
     terminalWrite( "\x1b[?1003l\x1b[?1006l", 18 );
 }
 
-void editorToggleMouse( void ) {
-  C.mouse_enabled = !C.mouse_enabled;
-  terminalSetMouseReporting( C.mouse_enabled );
-  editorSetStatusMessage( "Mouse support: %s",
-                          C.mouse_enabled ? "enabled" : "disabled" );
-}
-
 void terminalHandleResize( int signal_number ) {
   (void) signal_number;
   terminal_resize_pending = 1;
@@ -271,7 +263,7 @@ void editorHandleResize( void ) {
   editorClampViewport();
 }
 
-void disableRawMode() {
+void disableRawMode( void ) {
   if ( !T.raw_mode )
     return;
 
@@ -280,12 +272,14 @@ void disableRawMode() {
   T.raw_mode = 0;
 }
 
-void enableRawMode() {
+void enableRawMode( void ) {
+  struct termios raw;
+
   if ( tcgetattr( STDIN_FILENO, &E.orig_termios ) == -1 )
     die( "tcgetattr" );
   atexit( editorCleanup );
 
-  struct termios raw = E.orig_termios;
+  raw = E.orig_termios;
   raw.c_iflag &= ~(IXON | ICRNL | INPCK | ISTRIP | BRKINT);
   raw.c_oflag &= ~(OPOST);
   raw.c_cflag |= (CS8);
@@ -297,41 +291,41 @@ void enableRawMode() {
   if ( tcsetattr( STDIN_FILENO, TCSAFLUSH, &raw ) == -1 )
     die( "tcsetattr" );
   T.raw_mode = 1;
-  terminalSetMouseReporting( C.mouse_enabled );
+  terminalSetMouseReporting( 1 );
 }
 
-int editorReadKey() {
+int editorReadKey( void ) {
   int nread;
+  int mouse_len;
+  int mouse_done;
   char c;
+  char mouse_char;
+  char seq[3];
+  char mouse_seq[64];
 
   while ( (nread = terminalRead( &c, 1 )) != 1 ) 
     if ( nread == -1 && errno != EAGAIN )
       die( "read" );
 
   if ( c == '\x1b' ) {
-    char seq[3];
-
     if ( terminalRead( &seq[0], 1 ) != 1 )
       return '\x1b';
     if ( terminalRead( &seq[1], 1 ) != 1 )
       return '\x1b';
 
     if ( seq[0] == '[' ) {
-      if ( seq[1] == '<' && C.mouse_enabled ) {
-        char mouse_seq[64];
-        int mouse_len;
-        char mouse_char;
-
+      if ( seq[1] == '<' ) {
         mouse_seq[0] = '\x1b';
         mouse_seq[1] = '[';
         mouse_seq[2] = '<';
         mouse_len = 3;
-        while ( mouse_len < (int) sizeof( mouse_seq ) - 1 ) {
+        mouse_done = 0;
+        while ( mouse_done == 0 && mouse_len < (int) sizeof( mouse_seq ) - 1 ) {
           if ( terminalRead( &mouse_char, 1 ) != 1 )
             return '\x1b';
           mouse_seq[mouse_len++] = mouse_char;
           if ( mouse_char == 'M' || mouse_char == 'm' )
-            break;
+            mouse_done = 1;
         }
         mouse_seq[mouse_len] = '\0';
         if ( terminalParseSgrMouseEvent( mouse_seq, &last_mouse_event ) )
@@ -551,24 +545,29 @@ int editorSyntaxToColor( int hl ) {
   }
 }
 
-void editorSelectSyntaxHighlight() {
+void editorSelectSyntaxHighlight( void ) {
+  char *ext;
+  unsigned int j;
+  unsigned int i;
+  int is_ext;
+  int filerow;
+  struct editorSyntax *s;
+
   E.syntax = NULL;
   if ( E.filename == NULL )
     return;
 
-  char *ext = strrchr( E.filename, '.' );
-  unsigned int j;
+  ext = strrchr( E.filename, '.' );
 
   for ( j = 0; j < HLDB_ENTRIES; j++ ) {
-    struct editorSyntax *s = &HLDB[j];
-    unsigned int i = 0;
+    s = &HLDB[j];
+    i = 0;
     while ( s->filematch[i] ) {
-      int is_ext = (s->filematch[i][0] == '.');
+      is_ext = (s->filematch[i][0] == '.');
       if ( ( is_ext && ext && !strcmp( ext, s->filematch[i] ) ) ||
           ( !is_ext && strstr( E.filename, s->filematch[i] ) ) ) {
         E.syntax = s;
         
-        int filerow;
         for ( filerow = 0; filerow < E.numrows; filerow++ )
           editorUpdateSyntax( &E.row[filerow] );
 
@@ -727,11 +726,13 @@ void editorInsertChar( int c ) {
   E.cx++;
 }
 
-void editorInsertNewline() {
+void editorInsertNewline( void ) {
+  erow *row;
+
   if ( E.cx == 0 ) 
     editorInsertRow( E.cy, "", 0 );
   else {
-    erow *row = &E.row[E.cy];
+    row = &E.row[E.cy];
     editorInsertRow( E.cy + 1, &row->chars[E.cx], row->size - E.cx );
     row = &E.row[E.cy];
     row->size = E.cx;
@@ -742,13 +743,15 @@ void editorInsertNewline() {
   E.cx = 0;
 }
 
-void editorDelChar() {
+void editorDelChar( void ) {
+  erow *row;
+
   if ( E.cy == E.numrows )
     return;
   if ( E.cx == 0 && E.cy == 0 )
     return;
 
-  erow *row = &E.row[E.cy];
+  row = &E.row[E.cy];
   if ( E.cx > 0 ) {
     editorRowDelChar( row, E.cx - 1 );
     E.cx--;
@@ -805,7 +808,11 @@ void editorOpen( char *filename ) {
   E.dirty = 0;
 }
 
-void editorSave() {
+void editorSave( void ) {
+  int len;
+  int fd;
+  char *buf;
+
   if ( E.filename == NULL ) {
     E.filename = editorPrompt( "Save as: %s (ESC to cancel)", NULL );
     if ( E.filename == NULL ) {
@@ -815,10 +822,8 @@ void editorSave() {
     editorSelectSyntaxHighlight();
   }
 
-  int len;
-  char *buf = editorRowsToString( &len );
-
-  int fd = open( E.filename, O_RDWR | O_CREAT, 0644 );
+  buf = editorRowsToString( &len );
+  fd = open( E.filename, O_RDWR | O_CREAT, 0644 );
   if ( fd != -1 ) {
     if ( ftruncate( fd, len ) != -1 ) {
       if ( write( fd, buf, len ) == len ) {
@@ -890,13 +895,19 @@ void editorFindCallback( char *query, int key ) {
   }
 }
 
-void editorFind() {
-  int saved_cx = E.cx,
-      saved_cy = E.cy,
-      saved_coloff = E.coloff,
-      saved_rowoff = E.rowoff;
-  
-  char *query = editorPrompt( "Search: %s (Use ESC/Arrows/Enter)", editorFindCallback );
+void editorFind( void ) {
+  int saved_cx;
+  int saved_cy;
+  int saved_coloff;
+  int saved_rowoff;
+  char *query;
+
+  saved_cx = E.cx;
+  saved_cy = E.cy;
+  saved_coloff = E.coloff;
+  saved_rowoff = E.rowoff;
+
+  query = editorPrompt( "Search: %s (Use ESC/Arrows/Enter)", editorFindCallback );
 
   if ( query )
     free( query );
@@ -932,7 +943,7 @@ void abFree( struct abuf *ab ) {
 }
 
 /*   OUTPUT   */
-void editorScroll() {
+void editorScroll( void ) {
   E.rx = 0;
   if ( E.cy < E.numrows ) 
     E.rx = editorRowCxToRx( &E.row[E.cy], E.cx );
@@ -973,8 +984,31 @@ void editorClampViewport( void ) {
 }
 
 void editorScrollRows( int amount ) {
+  int max_cy;
+
   E.rowoff += amount;
   editorClampViewport();
+
+  if ( E.cy < E.rowoff ) {
+    E.cy = E.rowoff;
+    if ( E.cy < E.numrows ) {
+      if ( E.cx > E.row[E.cy].size )
+        E.cx = E.row[E.cy].size;
+    } else {
+      E.cx = 0;
+    }
+  } else if ( E.screenrows > 0 && E.cy >= E.rowoff + E.screenrows ) {
+    max_cy = E.rowoff + E.screenrows - 1;
+    if ( max_cy > E.numrows )
+      max_cy = E.numrows;
+    E.cy = max_cy;
+    if ( E.cy < E.numrows ) {
+      if ( E.cx > E.row[E.cy].size )
+        E.cx = E.row[E.cy].size;
+    } else {
+      E.cx = 0;
+    }
+  }
 }
 
 int editorHandleMouse( struct mouseEvent *event ) {
@@ -1200,10 +1234,11 @@ void editorDrawMessageBar( struct abuf *ab ) {
   }
 }
 
-void editorRefreshScreen() {
-  editorScroll();
-
+void editorRefreshScreen( void ) {
   struct abuf ab = ABUF_INIT;
+  char buf[32];
+
+  editorScroll();
 
   abAppend( &ab, "\x1b[?25l", 6 );
   abAppend( &ab, "\x1b[H", 3 );
@@ -1212,7 +1247,6 @@ void editorRefreshScreen() {
   editorDrawStatusBar( &ab );
   editorDrawMessageBar( &ab );
   
-  char buf[32];
   snprintf( buf, sizeof( buf ), "\x1b[%d;%dH", 
             (E.cy - E.rowoff) + 1, (E.rx - E.coloff) + 1 );
   abAppend( &ab, buf, strlen( buf ) );
@@ -1312,10 +1346,12 @@ void editorMoveCursor( int key ) {
     E.cx = rowlen;
 }
 
-void editorProcessKeypress() {
+void editorProcessKeypress( void ) {
   static int quit_times = ZINC_QUIT_TIMES;
+  int c;
+  int times;
 
-  int c = editorReadKey();
+  c = editorReadKey();
 
   switch ( c ) {
     case '\r':
@@ -1364,18 +1400,18 @@ void editorProcessKeypress() {
 
     case PAGE_UP:
     case PAGE_DOWN:
-      {
-        if ( c == PAGE_UP )
-          E.cy = E.rowoff;
-        else if ( c == PAGE_DOWN ) {
-          E.cy = E.rowoff + E.screenrows - 1;
-          if ( E.cy > E.numrows )
-            E.cy = E.numrows;
-        }
+      if ( c == PAGE_UP )
+        E.cy = E.rowoff;
+      else if ( c == PAGE_DOWN ) {
+        E.cy = E.rowoff + E.screenrows - 1;
+        if ( E.cy > E.numrows )
+          E.cy = E.numrows;
+      }
 
-        int times = E.screenrows;
-        while ( times-- )
-          editorMoveCursor( c == PAGE_UP ? ARROW_UP : ARROW_DOWN );
+      times = E.screenrows;
+      while ( times > 0 ) {
+        editorMoveCursor( c == PAGE_UP ? ARROW_UP : ARROW_DOWN );
+        times--;
       }
       break;
 
@@ -1391,7 +1427,6 @@ void editorProcessKeypress() {
       break;
 
     case CTRL_KEY( 'l' ):
-      editorToggleMouse();
       break;
 
     case '\x1b':
@@ -1405,7 +1440,7 @@ void editorProcessKeypress() {
 }
 
 /*   INIT   */
-void initEditor() {
+void initEditor( void ) {
   E.cx = E.cy = E.numrows = E.rowoff = E.coloff = 
     E.rx = E.dirty = 0;
   E.statusmsg_time = 0;

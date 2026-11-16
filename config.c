@@ -2,7 +2,7 @@
 
 struct editorConfigOptions C;
 
-void initConfigOptions() {
+void initConfigOptions( void ) {
   C.version = ZINC_CONFIG_VERSION;
   C.tab_width = ZINC_DEFAULT_TAB_WIDTH;
   C.scroll_rows = ZINC_DEFAULT_SCROLL_ROWS;

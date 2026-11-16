@@ -73,14 +73,18 @@ int testMouseScrolling( void ) {
   event.row = 2;
   ASSERT( editorHandleMouse( &event ) == 1 );
   ASSERT( E.rowoff == 1 );
+  ASSERT( E.cy == 1 );
 
   event.button = 65;
   ASSERT( editorHandleMouse( &event ) == 1 );
   ASSERT( E.rowoff == 2 );
+  ASSERT( E.cy == 2 );
 
+  E.cy = 5;
   event.button = 64;
   ASSERT( editorHandleMouse( &event ) == 1 );
   ASSERT( E.rowoff == 1 );
+  ASSERT( E.cy == 4 );
 
   event.button = 65;
   event.row = 5;
@@ -290,7 +294,7 @@ int testFileIO( void ) {
   return 0;
 }
 
-int main() {
+int main( void ) {
   if ( testConfigDefaults() != 0 )
     return 1;
   if ( testSgrMouseEvents() != 0 )
